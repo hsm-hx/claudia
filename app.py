@@ -85,6 +85,7 @@ async def probe_rate_limits() -> dict[str, Any]:
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": ANTHROPIC_VERSION,
+        "anthropic-beta": "token-counting-2024-11-01",
         "content-type": "application/json",
     }
     payload = {
