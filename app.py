@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-Claude Code Usage Monitor — Cloud Run Service
+Claude Code Rate-Limit & Usage Monitor — Cloud Run Service
 
-Monitors Anthropic API usage (covers GitHub Actions and API-based usage)
-and sends Discord notifications:
-  - Every hour at :00
-  - When billing period resets
-  - When remaining budget drops below 25%
+毎時0分に Anthropic API のレートリミット消費状況を Discord に通知します。
+  - 現在のウィンドウ（~4時間）でのトークン使用率（%）
+  - リセットまでの残り時間
+  - 残り25%以下でアラート
+  - リセット検知でアラート
+
+プローブ方法:
+  POST /v1/messages/count_tokens（トークン消費ゼロ）を呼び出し、
+  レスポンスヘッダーからリアルタイムのレートリミット情報を取得します。
 """
 
+import asyncio
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
@@ -31,162 +36,133 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
-# Config (from environment variables)
+# Config
 # ---------------------------------------------------------------------------
-def _require(name: str) -> str:
-    v = os.getenv(name, "")
-    if not v:
-        raise RuntimeError(f"Required environment variable {name!r} is not set.")
-    return v
-
-
 ANTHROPIC_API_KEY: str = ""
 DISCORD_WEBHOOK_URL: str = ""
-MONTHLY_BUDGET_USD: float = 100.0
-BILLING_CYCLE_DAY: int = 1
 PORT: int = 8080
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 
-# USD per million tokens  (November 2024 public pricing)
-PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4":     {"input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.50},
-    "claude-opus-4-5":   {"input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.50},
-    "claude-opus-4-6":   {"input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.50},
-    "claude-sonnet-4":   {"input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30},
-    "claude-sonnet-4-5": {"input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30},
-    "claude-sonnet-4-6": {"input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30},
-    "claude-haiku-4-5":  {"input": 0.80,  "output": 4.0,   "cache_write": 1.0,   "cache_read": 0.08},
-    # Fallback for unknown models
-    "default":           {"input": 3.0,   "output": 15.0,  "cache_write": 3.75,  "cache_read": 0.30},
-}
+# count_tokens に使うモデル（最安・最軽量）
+PROBE_MODEL = "claude-haiku-4-5-20251001"
 
-LOW_BUDGET_THRESHOLD = 0.25  # notify when remaining budget <= 25%
+LOW_REMAINING_THRESHOLD = 0.25  # 残り25%以下でアラート
 
 # ---------------------------------------------------------------------------
-# In-memory state  (reset on Cloud Run instance restart — acceptable)
+# State
 # ---------------------------------------------------------------------------
 _state: dict[str, Any] = {
-    "period_start": None,           # date: start of current billing period
-    "period_cost_usd": 0.0,        # float: accumulated cost this period
-    "prev_period_cost_usd": None,  # float | None: cost at last hourly check
-    "notified_low_budget": False,  # bool: already sent the <25% remaining alert?
-    "last_check_at": None,         # datetime | None
+    # 前回チェック時のレートリミット情報（リセット検知用）
+    "prev_reset_at": None,       # str | None: 前回の reset タイムスタンプ
+    "notified_low": False,       # bool: 今ウィンドウで低残量アラートを送信済みか
+    "last_check_at": None,       # datetime | None
+    "last_rl": {},               # dict: 最後に取得したレートリミット情報
 }
 
 
 # ---------------------------------------------------------------------------
-# Billing period helpers
+# Rate limit probe
 # ---------------------------------------------------------------------------
-def billing_period_start(for_date: date | None = None) -> date:
-    """Return the start date of the current billing period."""
-    d = for_date or date.today()
-    day = BILLING_CYCLE_DAY
-    if d.day >= day:
-        return d.replace(day=day)
-    # Roll back to previous month
-    if d.month == 1:
-        return date(d.year - 1, 12, day)
-    return date(d.year, d.month - 1, day)
-
-
-# ---------------------------------------------------------------------------
-# Anthropic usage API
-# ---------------------------------------------------------------------------
-async def fetch_usage(start: date, end: date) -> list[dict]:
+async def probe_rate_limits() -> dict[str, Any]:
     """
-    Fetch daily usage from the Anthropic usage API.
-    Returns a list of records:
-      [{"date": "YYYY-MM-DD", "model": str, "input_tokens": int,
-        "output_tokens": int, "cache_creation_input_tokens": int,
-        "cache_read_input_tokens": int}, ...]
+    POST /v1/messages/count_tokens でプローブし、レートリミットヘッダーを返す。
+    トークンを消費しないため無料で呼び出せる。
 
-    NOTE: The exact endpoint path may vary by Anthropic plan / org.
-    Adjust ANTHROPIC_USAGE_PATH env var if needed (default: /v1/usage).
+    返値の例:
+    {
+      "tokens": {
+        "limit": 200000, "remaining": 150000, "used": 50000,
+        "pct_used": 25.0, "reset": "2026-03-12T05:00:00Z"
+      },
+      "requests": { ... },
+      "input_tokens": { ... },
+    }
     """
-    path = os.getenv("ANTHROPIC_USAGE_PATH", "/v1/usage")
-    url = f"{ANTHROPIC_API_BASE}{path}"
+    url = f"{ANTHROPIC_API_BASE}/v1/messages/count_tokens"
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "anthropic-version": ANTHROPIC_VERSION,
-        "Content-Type": "application/json",
+        "content-type": "application/json",
     }
-    params = {
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
+    payload = {
+        "model": PROBE_MODEL,
+        "messages": [{"role": "user", "content": "ping"}],
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(url, headers=headers, params=params)
-        if resp.status_code == 404:
-            logger.warning(
-                "Anthropic usage endpoint returned 404. "
-                "Try setting ANTHROPIC_USAGE_PATH to the correct path for your plan."
-            )
-            return []
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
-        data = resp.json()
-        # Normalise: accept {"data": [...]} or {"usage": [...]} or [...]
-        if isinstance(data, list):
-            return data
-        if "data" in data:
-            return data["data"]
-        if "usage" in data:
-            return data["usage"]
-        return []
 
+    result: dict[str, Any] = {}
+    for name in ("tokens", "requests", "input-tokens", "output-tokens"):
+        prefix = f"anthropic-ratelimit-{name}-"
+        raw_limit = resp.headers.get(f"{prefix}limit")
+        raw_remaining = resp.headers.get(f"{prefix}remaining")
+        raw_reset = resp.headers.get(f"{prefix}reset")
+        if raw_limit is None:
+            continue
+        limit = int(raw_limit)
+        remaining = int(raw_remaining or 0)
+        used = limit - remaining
+        result[name] = {
+            "limit": limit,
+            "remaining": remaining,
+            "used": used,
+            "pct_used": used / limit * 100 if limit > 0 else 0.0,
+            "pct_remaining": remaining / limit * 100 if limit > 0 else 0.0,
+            "reset": raw_reset,  # ISO8601 string
+        }
 
-def _price_for_model(model: str) -> dict[str, float]:
-    # Try exact match, then prefix match
-    if model in PRICING:
-        return PRICING[model]
-    for key in PRICING:
-        if key != "default" and model.startswith(key):
-            return PRICING[key]
-    return PRICING["default"]
-
-
-def calc_cost(records: list[dict]) -> tuple[float, dict[str, Any]]:
-    """Return (total_cost_usd, aggregated_totals)."""
-    totals: dict[str, Any] = {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_write_tokens": 0,
-        "cache_read_tokens": 0,
-    }
-    total_cost = 0.0
-    for rec in records:
-        model = rec.get("model", "default")
-        p = _price_for_model(model)
-        inp = rec.get("input_tokens", 0)
-        out = rec.get("output_tokens", 0)
-        cw = rec.get("cache_creation_input_tokens", 0)
-        cr = rec.get("cache_read_input_tokens", 0)
-        total_cost += (
-            inp * p["input"]
-            + out * p["output"]
-            + cw * p["cache_write"]
-            + cr * p["cache_read"]
-        ) / 1_000_000
-        totals["input_tokens"] += inp
-        totals["output_tokens"] += out
-        totals["cache_write_tokens"] += cw
-        totals["cache_read_tokens"] += cr
-    return total_cost, totals
-
-
-def fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
+    logger.info("Rate limits: %s", result)
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Discord notification
+# Helpers
+# ---------------------------------------------------------------------------
+def _parse_reset(reset_str: str | None) -> datetime | None:
+    if not reset_str:
+        return None
+    try:
+        return datetime.fromisoformat(reset_str.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _time_until_reset(reset_str: str | None) -> str:
+    reset_dt = _parse_reset(reset_str)
+    if reset_dt is None:
+        return "不明"
+    now = datetime.now(timezone.utc)
+    delta = reset_dt - now
+    if delta.total_seconds() <= 0:
+        return "まもなくリセット"
+    total_sec = int(delta.total_seconds())
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}時間{m}分後"
+    return f"{m}分{s}秒後"
+
+
+def _bar(pct_used: float, width: int = 10) -> str:
+    filled = min(width, int(pct_used / 100 * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _color(pct_remaining: float) -> int:
+    if pct_remaining <= 25:
+        return 0xEF4444   # red
+    if pct_remaining <= 50:
+        return 0xF59E0B   # amber
+    return 0x22C55E       # green
+
+
+# ---------------------------------------------------------------------------
+# Discord
 # ---------------------------------------------------------------------------
 async def send_discord(embeds: list[dict]) -> None:
     payload = json.dumps({"embeds": embeds}).encode()
@@ -196,77 +172,94 @@ async def send_discord(embeds: list[dict]) -> None:
             content=payload,
             headers={"Content-Type": "application/json"},
         )
-        if resp.status_code not in (200, 204):
-            logger.error("Discord responded %d: %s", resp.status_code, resp.text)
-        else:
-            logger.info("Discord notification sent (status %d).", resp.status_code)
+    if resp.status_code not in (200, 204):
+        logger.error("Discord %d: %s", resp.status_code, resp.text)
+    else:
+        logger.info("Discord notified (%d).", resp.status_code)
 
 
-def build_hourly_embed(
-    period_start: date,
-    cost_usd: float,
-    budget_usd: float,
-    totals: dict,
-    extra_label: str = "",
-) -> dict:
-    remaining_usd = max(0.0, budget_usd - cost_usd)
-    pct_used = min(100.0, cost_usd / budget_usd * 100) if budget_usd > 0 else 0.0
-    pct_remaining = 100.0 - pct_used
-
-    bar_filled = int(pct_used / 10)
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
-
-    color = 0x22C55E  # green
-    if pct_remaining <= 25:
-        color = 0xEF4444  # red
-    elif pct_remaining <= 50:
-        color = 0xF59E0B  # amber
-
-    title = "Claude Code Usage Report"
-    if extra_label:
-        title = f"⚡ {extra_label} — {title}"
-
+def build_rate_limit_embed(rl: dict[str, Any], extra_label: str = "") -> dict:
+    """レートリミット使用率を示す Discord Embed を生成する。"""
     now_jst = datetime.now(timezone.utc) + timedelta(hours=9)
+
+    # tokens が最重要指標。なければ input-tokens を使う
+    primary = rl.get("tokens") or rl.get("input-tokens") or {}
+    pct_used = primary.get("pct_used", 0.0)
+    pct_remaining = primary.get("pct_remaining", 100.0)
+    reset_str = primary.get("reset")
+
+    title = "Claude Code レートリミット使用状況"
+    if extra_label:
+        title = f"{extra_label}  |  {title}"
+
+    fields: list[dict] = [
+        {
+            "name": "チェック時刻 (JST)",
+            "value": now_jst.strftime("%Y-%m-%d %H:%M"),
+            "inline": True,
+        },
+        {
+            "name": "リセットまで",
+            "value": _time_until_reset(reset_str),
+            "inline": True,
+        },
+    ]
+
+    # 主要ウィンドウの使用率バー
+    if primary:
+        limit = primary.get("limit", 0)
+        used = primary.get("used", 0)
+        remaining = primary.get("remaining", 0)
+        fields.append({
+            "name": f"トークン使用率（ウィンドウ上限: {limit:,}）",
+            "value": (
+                f"`{_bar(pct_used)}` **{pct_used:.1f}%** 使用\n"
+                f"✅ 使用済み: **{used:,}** トークン\n"
+                f"💚 残り:     **{remaining:,}** トークン  （{pct_remaining:.1f}%）"
+            ),
+            "inline": False,
+        })
+
+    # リクエスト数
+    req = rl.get("requests")
+    if req:
+        fields.append({
+            "name": f"リクエスト数（上限: {req['limit']:,}）",
+            "value": (
+                f"`{_bar(req['pct_used'])}` **{req['pct_used']:.1f}%** 使用\n"
+                f"残り: **{req['remaining']:,}** req  （リセット: {_time_until_reset(req.get('reset'))}）"
+            ),
+            "inline": False,
+        })
+
+    # input / output 内訳
+    inp = rl.get("input-tokens")
+    out = rl.get("output-tokens")
+    if inp or out:
+        sub_lines = []
+        if inp:
+            sub_lines.append(
+                f"📥 Input:  {inp['used']:,} / {inp['limit']:,}  （{inp['pct_used']:.1f}%）"
+            )
+        if out:
+            sub_lines.append(
+                f"📤 Output: {out['used']:,} / {out['limit']:,}  （{out['pct_used']:.1f}%）"
+            )
+        fields.append({
+            "name": "トークン内訳",
+            "value": "\n".join(sub_lines),
+            "inline": False,
+        })
 
     return {
         "title": title,
-        "color": color,
-        "fields": [
-            {
-                "name": "Billing Period",
-                "value": f"`{period_start}` 〜 now",
-                "inline": True,
-            },
-            {
-                "name": "Checked at (JST)",
-                "value": now_jst.strftime("%Y-%m-%d %H:%M"),
-                "inline": True,
-            },
-            {
-                "name": "Budget Usage",
-                "value": (
-                    f"`{bar}` {pct_used:.1f}%\n"
-                    f"💰 Used: **${cost_usd:.4f}** / ${budget_usd:.2f}\n"
-                    f"💚 Remaining: **${remaining_usd:.4f}** ({pct_remaining:.1f}%)"
-                ),
-                "inline": False,
-            },
-            {
-                "name": "Token Breakdown",
-                "value": (
-                    f"📥 Input:        {fmt_tokens(totals['input_tokens'])}\n"
-                    f"📤 Output:       {fmt_tokens(totals['output_tokens'])}\n"
-                    f"⚡ Cache Read:   {fmt_tokens(totals['cache_read_tokens'])}\n"
-                    f"🔧 Cache Write:  {fmt_tokens(totals['cache_write_tokens'])}"
-                ),
-                "inline": False,
-            },
-        ],
+        "color": _color(pct_remaining),
+        "fields": fields,
         "footer": {
             "text": (
-                "Claude Code Usage Monitor | "
-                "Coverage: API usage (GitHub Actions, Claude Code API) — "
-                "Claude.ai subscription usage not included"
+                "Claude Code Usage Monitor  |  "
+                "データソース: Anthropic API rate-limit headers  |  "
+                "対象: API キー経由の全使用（GitHub Actions 含む）"
             )
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -284,102 +277,80 @@ def build_alert_embed(title: str, description: str, color: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Core check logic
+# Core check
 # ---------------------------------------------------------------------------
 async def run_check(reason: str = "hourly") -> None:
-    logger.info("Running usage check (reason=%s).", reason)
-
-    today = date.today()
-    period_start = billing_period_start(today)
-    period_end = today + timedelta(days=1)
-
+    logger.info("Running check (reason=%s).", reason)
     embeds: list[dict] = []
 
     try:
-        records = await fetch_usage(period_start, period_end)
+        rl = await probe_rate_limits()
     except Exception as exc:
-        logger.error("Failed to fetch usage: %s", exc)
-        embeds.append(
-            build_alert_embed(
-                "⚠️ Usage Fetch Error",
-                f"Could not retrieve usage data from Anthropic API.\n\n```{exc}```",
-                0xEF4444,
-            )
-        )
+        logger.error("probe_rate_limits failed: %s", exc)
+        embeds.append(build_alert_embed(
+            "⚠️ プローブ失敗",
+            f"Anthropic API へのプローブが失敗しました。\n\n```\n{exc}\n```",
+            0xEF4444,
+        ))
         await send_discord(embeds)
         return
 
-    cost_usd, totals = calc_cost(records)
-    prev_cost = _state["prev_period_cost_usd"]
-    was_notified_low = _state["notified_low_budget"]
+    primary = rl.get("tokens") or rl.get("input-tokens") or {}
+    pct_remaining = primary.get("pct_remaining", 100.0)
+    reset_str = primary.get("reset")
+    prev_reset = _state["prev_reset_at"]
 
-    # --- Detect billing period reset ---
-    reset_detected = False
-    if (
-        prev_cost is not None
-        and cost_usd < prev_cost * 0.5  # cost dropped by >50%
-        and prev_cost > 0.01
-    ):
-        reset_detected = True
-        _state["notified_low_budget"] = False  # reset the low-budget flag
-        logger.info("Billing period reset detected (prev=%.4f, now=%.4f).", prev_cost, cost_usd)
-        embeds.append(
-            build_alert_embed(
-                "🔄 Billing Period Reset",
-                f"Usage has reset to **${cost_usd:.4f}**.\nNew period started from `{period_start}`.",
-                0x6366F1,
-            )
-        )
+    extra_label = ""
 
-    # --- Detect low budget (crossing below 25% remaining) ---
-    remaining_pct = (1 - cost_usd / MONTHLY_BUDGET_USD) if MONTHLY_BUDGET_USD > 0 else 1.0
-    if (
-        remaining_pct <= LOW_BUDGET_THRESHOLD
-        and not _state["notified_low_budget"]
-        and not reset_detected
-    ):
-        _state["notified_low_budget"] = True
-        remaining_usd = max(0.0, MONTHLY_BUDGET_USD - cost_usd)
-        embeds.append(
-            build_alert_embed(
-                "🚨 Budget Alert: Below 25% Remaining",
-                (
-                    f"You have **${remaining_usd:.4f}** remaining "
-                    f"({remaining_pct * 100:.1f}%) of your monthly budget "
-                    f"(**${MONTHLY_BUDGET_USD:.2f}**).\n\n"
-                    f"Current spend: **${cost_usd:.4f}**"
-                ),
-                0xEF4444,
-            )
-        )
+    # --- リセット検知 ---
+    # reset タイムスタンプが前回から変わっていたらリセット発生
+    if prev_reset is not None and reset_str and reset_str != prev_reset:
+        _state["notified_low"] = False
+        extra_label = "🔄 リセット"
+        embeds.append(build_alert_embed(
+            "🔄 レートリミット リセット",
+            f"レートリミットがリセットされました！\n新しいウィンドウ: リセット予定 `{reset_str}`",
+            0x6366F1,
+        ))
+        logger.info("Rate limit reset detected. New window reset=%s", reset_str)
 
-    # --- Always send hourly summary ---
-    extra_label = "Reset" if reset_detected else ("Low Budget" if _state["notified_low_budget"] and not was_notified_low else "")
-    embeds.append(
-        build_hourly_embed(period_start, cost_usd, MONTHLY_BUDGET_USD, totals, extra_label)
-    )
+    # --- 残り25%以下アラート ---
+    if pct_remaining <= LOW_REMAINING_THRESHOLD * 100 and not _state["notified_low"]:
+        _state["notified_low"] = True
+        extra_label = extra_label or "🚨 低残量"
+        embeds.append(build_alert_embed(
+            "🚨 レートリミット残量アラート（残り25%以下）",
+            (
+                f"現在のウィンドウでのレートリミット残量が **{pct_remaining:.1f}%** になりました。\n\n"
+                f"リセットまで: **{_time_until_reset(reset_str)}**\n"
+                f"残りトークン: **{primary.get('remaining', 0):,}** / {primary.get('limit', 0):,}"
+            ),
+            0xEF4444,
+        ))
 
-    # Update state
-    _state["period_start"] = period_start
-    _state["period_cost_usd"] = cost_usd
-    _state["prev_period_cost_usd"] = cost_usd
+    # --- 毎時の定期レポート ---
+    embeds.append(build_rate_limit_embed(rl, extra_label))
+
+    # State 更新
+    _state["prev_reset_at"] = reset_str
     _state["last_check_at"] = datetime.now(timezone.utc)
+    _state["last_rl"] = rl
 
     await send_discord(embeds)
-    logger.info("Check complete. Period cost: $%.4f", cost_usd)
+    logger.info("Check done. tokens remaining=%.1f%%", pct_remaining)
 
 
 # ---------------------------------------------------------------------------
-# FastAPI + APScheduler lifecycle
+# FastAPI + APScheduler
 # ---------------------------------------------------------------------------
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global ANTHROPIC_API_KEY, DISCORD_WEBHOOK_URL, MONTHLY_BUDGET_USD, BILLING_CYCLE_DAY, PORT
+    global ANTHROPIC_API_KEY, DISCORD_WEBHOOK_URL, PORT
 
-    # Load .env if present (local development)
+    # ローカル開発用 .env 読み込み
     env_file = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_file):
         with open(env_file) as f:
@@ -389,23 +360,22 @@ async def lifespan(_: FastAPI):
                     k, _, v = line.partition("=")
                     os.environ.setdefault(k.strip(), v.strip())
 
+    def _require(name: str) -> str:
+        v = os.getenv(name, "")
+        if not v:
+            raise RuntimeError(f"必須の環境変数 {name!r} が設定されていません。")
+        return v
+
     ANTHROPIC_API_KEY = _require("ANTHROPIC_API_KEY")
     DISCORD_WEBHOOK_URL = _require("DISCORD_WEBHOOK_URL")
-    MONTHLY_BUDGET_USD = float(os.getenv("MONTHLY_BUDGET_USD", "100.0"))
-    BILLING_CYCLE_DAY = max(1, min(28, int(os.getenv("BILLING_CYCLE_DAY", "1"))))
     PORT = int(os.getenv("PORT", "8080"))
 
-    logger.info(
-        "Starting Claude Code Usage Monitor | budget=$%.2f | billing day=%d",
-        MONTHLY_BUDGET_USD,
-        BILLING_CYCLE_DAY,
-    )
+    logger.info("Claude Code Usage Monitor 起動")
 
-    # Run immediately on startup
-    import asyncio
+    # 起動直後に1回チェック
     asyncio.create_task(run_check("startup"))
 
-    # Schedule hourly at :00
+    # 毎時0分にチェック
     scheduler.add_job(
         run_check,
         CronTrigger(minute=0),
@@ -414,12 +384,11 @@ async def lifespan(_: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("Scheduler started. Next run at the top of the next hour.")
+    logger.info("スケジューラ起動。毎時0分に実行。")
 
     yield
 
     scheduler.shutdown(wait=False)
-    logger.info("Scheduler stopped.")
 
 
 app = FastAPI(title="Claude Code Usage Monitor", lifespan=lifespan)
@@ -427,29 +396,25 @@ app = FastAPI(title="Claude Code Usage Monitor", lifespan=lifespan)
 
 @app.get("/")
 async def health() -> dict:
+    rl = _state.get("last_rl", {})
+    primary = rl.get("tokens") or rl.get("input-tokens") or {}
     return {
         "status": "ok",
         "last_check_at": _state["last_check_at"].isoformat() if _state["last_check_at"] else None,
-        "period_cost_usd": _state["period_cost_usd"],
-        "notified_low_budget": _state["notified_low_budget"],
+        "tokens_pct_remaining": primary.get("pct_remaining"),
+        "tokens_pct_used": primary.get("pct_used"),
+        "reset_at": primary.get("reset"),
+        "notified_low": _state["notified_low"],
     }
 
 
 @app.post("/check")
 async def manual_check() -> dict:
-    """Trigger a manual usage check (useful for testing)."""
-    import asyncio
+    """手動チェックをトリガーする（動作確認用）。"""
     asyncio.create_task(run_check("manual"))
     return {"status": "check triggered"}
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8080")),
-        log_level="info",
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), log_level="info")
