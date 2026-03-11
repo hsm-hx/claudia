@@ -66,37 +66,8 @@ _state: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 # Rate limit probe
 # ---------------------------------------------------------------------------
-async def probe_rate_limits() -> dict[str, Any]:
-    """
-    POST /v1/messages/count_tokens でプローブし、レートリミットヘッダーを返す。
-    トークンを消費しないため無料で呼び出せる。
-
-    返値の例:
-    {
-      "tokens": {
-        "limit": 200000, "remaining": 150000, "used": 50000,
-        "pct_used": 25.0, "reset": "2026-03-12T05:00:00Z"
-      },
-      "requests": { ... },
-      "input_tokens": { ... },
-    }
-    """
-    url = f"{ANTHROPIC_API_BASE}/v1/messages/count_tokens"
-    headers = {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": ANTHROPIC_VERSION,
-        "anthropic-beta": "token-counting-2024-11-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": PROBE_MODEL,
-        "messages": [{"role": "user", "content": "ping"}],
-    }
-
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-
+def _parse_rl_headers(resp: httpx.Response) -> dict[str, Any]:
+    """レスポンスヘッダーから anthropic-ratelimit-* を抽出して返す。"""
     result: dict[str, Any] = {}
     for name in ("tokens", "requests", "input-tokens", "output-tokens"):
         prefix = f"anthropic-ratelimit-{name}-"
@@ -114,11 +85,65 @@ async def probe_rate_limits() -> dict[str, Any]:
             "used": used,
             "pct_used": used / limit * 100 if limit > 0 else 0.0,
             "pct_remaining": remaining / limit * 100 if limit > 0 else 0.0,
-            "reset": raw_reset,  # ISO8601 string
+            "reset": raw_reset,
         }
-
-    logger.info("Rate limits: %s", result)
     return result
+
+
+async def probe_rate_limits() -> dict[str, Any]:
+    """
+    Anthropic API をプローブしてレートリミットヘッダーを取得する。
+
+    試行順:
+      1. GET /v1/models          （無料・確実）
+      2. POST /v1/messages/count_tokens  （ベータ、フォールバック）
+
+    返値の例:
+    {
+      "tokens": {"limit": 200000, "remaining": 150000, "used": 50000,
+                 "pct_used": 25.0, "pct_remaining": 75.0, "reset": "..."},
+      "requests": { ... },
+    }
+    """
+    common_headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        # --- 試行1: GET /v1/models（無料） ---
+        try:
+            resp = await client.get(
+                f"{ANTHROPIC_API_BASE}/v1/models",
+                headers=common_headers,
+            )
+            resp.raise_for_status()
+            result = _parse_rl_headers(resp)
+            if result:
+                logger.info("probe via GET /v1/models OK")
+                return result
+            logger.info("GET /v1/models returned no RL headers; falling back to count_tokens")
+        except Exception as exc:
+            logger.warning("GET /v1/models failed: %s", exc)
+
+        # --- 試行2: POST /v1/messages/count_tokens ---
+        try:
+            resp = await client.post(
+                f"{ANTHROPIC_API_BASE}/v1/messages/count_tokens",
+                headers={**common_headers, "anthropic-beta": "token-counting-2024-11-01",
+                         "content-type": "application/json"},
+                json={"model": PROBE_MODEL, "messages": [{"role": "user", "content": "ping"}]},
+            )
+            if not resp.is_success:
+                body = resp.text
+                raise RuntimeError(
+                    f"count_tokens {resp.status_code}: {body}"
+                )
+            result = _parse_rl_headers(resp)
+            logger.info("probe via count_tokens OK")
+            return result
+        except Exception as exc:
+            raise RuntimeError(f"すべてのプローブに失敗しました: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
